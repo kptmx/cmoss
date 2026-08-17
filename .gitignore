@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environments / secrets
+.env
+
+# Tool caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Flet
+.flet/
+storage/
+
+# Build artifacts
+build/
+winbuild/
+dist/
+
+# IDE
+.idea/
+.vscode/
+
+# macOS
+.DS_Store
+
+# Large binaries (mpv runtime — not distributed via git)
+*.dll
+*.so
+*.dylib
+winmpv/
+
+# PyInstaller
+*.spec
