@@ -38,8 +38,6 @@ class Store:
         self.config = cfg
         self.server = Server(cfg)
         self.proxy: ProxyServer | None = None
-        self.player = PlayerModel(self)
-        self.media_control = None
 
         self._loop: asyncio.AbstractEventLoop | None = None
         self._tasks: set = set()
@@ -54,6 +52,9 @@ class Store:
         self.toast = DataBox([])
         self.toast_progress = DataBox({})  # toast_id -> remaining fraction (0..1)
         self._toast_seq = 0
+
+        self.player = PlayerModel(self)
+        self.media_control = None
         self.screen = DataBox("home")
         self.connected = DataBox(False)
         self.nav_counter = DataBox(0)
@@ -693,10 +694,21 @@ class Store:
         except Exception:
             pass
 
+    def set_check_updates(self, value: bool):
+        """Enable/disable update checking and persist the choice."""
+        self.config.check_updates = bool(value)
+        from .config import save_config
+
+        try:
+            save_config(self.config)
+        except Exception:
+            pass
+
     # -- toasts -----------------------------------------------------------
 
     def show_toast(self, msg: str, seconds: float = 3.0, cover: str | None = None,
-                   persistent: bool = False, on_click=None):
+                   persistent: bool = False, on_click=None, has_progress: bool = False,
+                   dismissible: bool | None = None):
         """Push a notification onto the top-right stack.
 
         The card slides in once the client mounts it (`settle_toast`), and is
@@ -709,11 +721,16 @@ class Store:
         stays on screen until explicitly dismissed.  *on_click* (optional) is
         a zero-argument callable invoked when the user clicks the card body."""
         self._toast_seq += 1
+        if self._shutdown_done:
+            return
+        if dismissible is None:
+            dismissible = not persistent
         toast = {"id": self._toast_seq, "msg": str(msg), "seconds": seconds,
                  "settled": False, "leaving": False,
                  "remaining": max(0.0, seconds), "paused": False,
                  "cover": cover, "persistent": persistent,
-                 "on_click": on_click}
+                 "on_click": on_click, "has_progress": has_progress,
+                 "dismissible": dismissible}
         self.toast.set(list(self.toast.get() or []) + [toast])
         self._publish_toast_progress()
         if not persistent:
@@ -826,6 +843,8 @@ class Store:
     async def _do_check_update(self):
         """Check GitHub releases; show a persistent toast if an update is
         available."""
+        if not self.config.check_updates:
+            return
         from . import __version__
         release = await get_latest_release()
         if release is None:
@@ -835,7 +854,9 @@ class Store:
         self.show_toast(
             f"Update available: {release.tag}",
             persistent=True,
-            on_click=lambda r=release: self._show_update_dialog(r),
+            dismissible=True,
+            on_click=lambda r=release, tid=self._toast_seq:
+                (self.dismiss_toast(tid), self._show_update_dialog(r)),
         )
 
     def _show_update_dialog(self, release):
@@ -854,16 +875,16 @@ class Store:
             ),
             actions=[
                 ft.TextButton("Update", on_click=lambda e: (
-                    e.control.page.close(dialog),
+                    self._page.pop_dialog(),
                     self._start_update(release.tag),
                 )),
                 ft.TextButton("Later", on_click=lambda e: (
-                    e.control.page.close(dialog),
+                    self._page.pop_dialog(),
                 )),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
         )
-        self._page.open(dialog)
+        self._page.show_dialog(dialog)
 
     def _start_update(self, tag: str):
         """Begin downloading the update; show a progress toast."""
@@ -873,7 +894,7 @@ class Store:
     async def _do_update(self, tag: str):
         """Download and extract the update, then prompt restart."""
         self._update_toast_id = self._toast_seq + 1
-        self.show_toast("Downloading update…", persistent=True)
+        self.show_toast("Downloading update…", persistent=True, has_progress=True)
 
         def _progress(read: int, total: int):
             frac = read / total if total > 0 else 0.0
@@ -895,6 +916,17 @@ class Store:
                     break
         else:
             self.update_toast_msg(self._update_toast_id, "Update failed.")
+            # Auto-dismiss after 3 seconds: flip persistent and start clock
+            toasts = list(self.toast.get() or [])
+            for t in toasts:
+                if t["id"] == self._update_toast_id:
+                    t["persistent"] = False
+                    t["has_progress"] = False
+                    t["remaining"] = 3.0
+                    t["seconds"] = 3.0
+                    self.toast.set(toasts)
+                    self.run(self._toast_clock(t["id"]))
+                    break
 
     # -- lifecycle -------------------------------------------------------
 

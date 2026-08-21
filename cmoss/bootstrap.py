@@ -9,7 +9,7 @@ module that exists on disk in the update directory.
 Usage from ``main.py``::
 
     from cmoss.bootstrap import bootstrap
-    bootstrap()          # no-op when not frozen or no update present
+    bootstrap()          # no-op when no update present
 
     from cmoss.main import main   # now loads from update/ if available
     ft.run(main=main)
@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import importlib.abc
 import importlib.machinery
+import importlib.util
 import logging
 import os
 import sys
@@ -57,12 +58,12 @@ class _UpdateFinder(importlib.abc.MetaPathFinder):
     def __init__(self, root: str) -> None:
         self._root = root
 
-    # importlib.abc.MetaPathFinder (Python ≥ 3.4)
-    def find_module(  # type: ignore[override]
+    def find_spec(
         self,
         fullname: str,
-        path: object = None,
-    ) -> _FileLoader | None:
+        path: object,
+        target: types.ModuleType | None = None,
+    ) -> importlib.machinery.ModuleSpec | None:
         if not (fullname == "cmoss" or fullname.startswith("cmoss.")):
             return None
 
@@ -72,15 +73,26 @@ class _UpdateFinder(importlib.abc.MetaPathFinder):
         # package?
         init = os.path.join(base, "__init__.py")
         if os.path.isfile(init):
-            return _FileLoader(fullname, init, is_package=True)
+            loader = _FileLoader(fullname, init, is_package=True)
+            return importlib.machinery.ModuleSpec(
+                fullname, loader,
+                origin=init,
+                is_package=True,
+            )
 
         # module?
-        mod = os.path.join(
-            os.path.join(self._root, *parts[:-1]),
-            parts[-1] + ".py",
-        ) if len(parts) > 1 else os.path.join(self._root, parts[0] + ".py")
+        if len(parts) > 1:
+            mod = os.path.join(os.path.join(self._root, *parts[:-1]),
+                               parts[-1] + ".py")
+        else:
+            mod = os.path.join(self._root, parts[0] + ".py")
         if os.path.isfile(mod):
-            return _FileLoader(fullname, mod, is_package=False)
+            loader = _FileLoader(fullname, mod, is_package=False)
+            return importlib.machinery.ModuleSpec(
+                fullname, loader,
+                origin=mod,
+                is_package=False,
+            )
 
         return None
 
@@ -112,12 +124,9 @@ def bootstrap() -> None:
     """Install the update overlay finder when appropriate.
 
     Safe to call unconditionally — it is a no-op when:
-    * the process is not frozen (development mode), or
     * no update has been downloaded yet (``update/cmoss/__init__.py``
       does not exist).
     """
-    if not getattr(sys, "frozen", False):
-        return
 
     init = os.path.join(update_dir(), "cmoss", "__init__.py")
     if not os.path.isfile(init):

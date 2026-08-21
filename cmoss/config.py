@@ -33,6 +33,7 @@ class Config:
     max_cache_bytes: int = 2 * 1024 * 1024 * 1024
     panel_width: int = 320
     track_toast: bool = True  # show a notification when a track starts
+    check_updates: bool = True  # check for updates on startup
 
     def is_complete(self) -> bool:
         return bool(self.username and (self.password or self.api_key))

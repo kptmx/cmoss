@@ -48,7 +48,10 @@ def TitleBar(store):
         page.update()
 
     async def close(e):
-        exit(0)  # triggers atexit handlers, including store.shutdown()
+        page.window.prevent_close = False
+        page.update()
+        store.shutdown()
+        await page.window.close()
 
     win_btn = lambda icon, tip, on_click, hover=None: ft.IconButton(
         icon=icon, icon_size=12, width=40, height=26, style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=0)),
@@ -822,7 +825,54 @@ def _toast_card(store, t):
         frac = 0.0
     on_mounted(lambda: store.settle_toast(t["id"]))
     persistent = t.get("persistent")
+    dismissible = t.get("dismissible", not persistent)
     has_click = t.get("on_click") is not None
+    has_progress = t.get("has_progress")
+    controls = [
+        ft.Container(
+            padding=ft.Padding.symmetric(horizontal=14, vertical=10),
+            content=ft.Row(
+                spacing=8,
+                controls=[
+                    *([ft.Image(
+                        src=t["cover"], width=40, height=40,
+                        fit=ft.BoxFit.COVER, border_radius=6,
+                    )] if t.get("cover") else []),
+                    ft.Text(t["msg"], size=13, expand=True, max_lines=3,
+                            overflow=ft.TextOverflow.ELLIPSIS,
+                            color=ft.Colors.ON_SURFACE),
+                    *([] if not dismissible else [
+                        ft.IconButton(
+                            icon=ft.Icons.CLOSE, icon_size=14,
+                            icon_color=ft.Colors.ON_SURFACE_VARIANT,
+                            tooltip="Close",
+                            on_click=lambda e, tid=t["id"]: store.dismiss_toast(tid),
+                        ),
+                    ]),
+                ],
+            ),
+        ),
+    ]
+    if has_progress:
+        controls.append(ft.Container(
+            padding=ft.Padding.only(left=14, right=14, top=0, bottom=8),
+            content=ft.ProgressBar(
+                value=frac,
+                bar_height=4,
+                color=ft.Colors.PRIMARY,
+                bgcolor=ft.Colors.with_opacity(0.10, ft.Colors.ON_SURFACE),
+                border_radius=4,
+            ),
+        ))
+    elif not persistent:
+        controls.append(ft.ProgressBar(
+            value=frac,
+            bar_height=3,
+            color=ft.Colors.PRIMARY,
+            bgcolor=ft.Colors.with_opacity(0.10, ft.Colors.ON_SURFACE),
+            border_radius=ft.BorderRadius.only(
+                bottom_left=6, bottom_right=6),
+        ))
     return ft.Container(
         width=360,
         border_radius=6,
@@ -845,42 +895,7 @@ def _toast_card(store, t):
         ),
         on_click=lambda e, cb=t.get("on_click"): cb() if cb else None,
         ink=has_click,
-        content=ft.Column(
-            spacing=0,
-            controls=[
-                ft.Container(
-                    padding=ft.Padding.symmetric(horizontal=14, vertical=10),
-                    content=ft.Row(
-                        spacing=8,
-                        controls=[
-                            *([ft.Image(
-                                src=t["cover"], width=40, height=40,
-                                fit=ft.BoxFit.COVER, border_radius=6,
-                            )] if t.get("cover") else []),
-                            ft.Text(t["msg"], size=13, expand=True, max_lines=3,
-                                    overflow=ft.TextOverflow.ELLIPSIS,
-                                    color=ft.Colors.ON_SURFACE),
-                            *([] if persistent else [
-                                ft.IconButton(
-                                    icon=ft.Icons.CLOSE, icon_size=14,
-                                    icon_color=ft.Colors.ON_SURFACE_VARIANT,
-                                    tooltip="Close",
-                                    on_click=lambda e, tid=t["id"]: store.dismiss_toast(tid),
-                                ),
-                            ]),
-                        ],
-                    ),
-                ),
-                ft.ProgressBar(
-                    value=frac,
-                    bar_height=3,
-                    color=ft.Colors.PRIMARY,
-                    bgcolor=ft.Colors.with_opacity(0.10, ft.Colors.ON_SURFACE),
-                    border_radius=ft.BorderRadius.only(
-                        bottom_left=6, bottom_right=6),
-                ),
-            ],
-        ),
+        content=ft.Column(spacing=0, controls=controls),
     )
 
 
@@ -1618,6 +1633,16 @@ def SettingsScreen(store):
                 info_row("Server", cfg.server_display()),
                 info_row("Username", cfg.username),
                 info_row("Cache directory", cfg.cache_dir),
+                ft.Container(height=4),
+                ft.FilledButton(
+                    "Log out",
+                    icon=ft.Icons.LOGOUT,
+                    on_click=lambda e: store.logout(),
+                    style=ft.ButtonStyle(
+                        bgcolor=ft.Colors.ERROR_CONTAINER,
+                        color=ft.Colors.ON_ERROR_CONTAINER,
+                    ),
+                ),
             ],
         ),
     )
@@ -1687,6 +1712,39 @@ def SettingsScreen(store):
                     on_change=lambda e: store.set_track_toast(
                         bool(e.control.value)),
                 ),
+                ft.Checkbox(
+                    label="Check for updates on startup",
+                    value=cfg.check_updates,
+                    on_change=lambda e: store.set_check_updates(
+                        bool(e.control.value)),
+                ),
+            ],
+        ),
+    )
+
+    from .. import __version__
+
+    update_card = ft.Container(
+        padding=ft.Padding.all(16),
+        bgcolor=ft.Colors.SURFACE_CONTAINER,
+        border_radius=12,
+        content=ft.Column(
+            spacing=8,
+            controls=[
+                ft.Text("Updates", size=13, weight=ft.FontWeight.BOLD,
+                        color=ft.Colors.PRIMARY),
+                ft.Row(
+                    spacing=8,
+                    controls=[
+                        ft.Text(f"v{__version__}", size=12,
+                                color=ft.Colors.ON_SURFACE_VARIANT),
+                        ft.Container(expand=True),
+                        ft.OutlinedButton(
+                            "Check for updates",
+                            on_click=lambda e: store._check_update(),
+                        ),
+                    ],
+                ),
             ],
         ),
     )
@@ -1695,24 +1753,16 @@ def SettingsScreen(store):
         expand=True,
         padding=ft.Padding(left=_RAIL_W + _CONTENT_GAP - 8,
                            right=24, top=16, bottom=_PLAYER_BAR_H + 8),
-        content=ft.Column(
-            spacing=12,
+        content=ft.ListView(
             expand=True,
+            spacing=12,
+            padding=ft.Padding.only(bottom=16),
             controls=[
                 ft.Text("Settings", size=20, weight=ft.FontWeight.BOLD),
                 conn_card,
                 notif_card,
+                update_card,
                 cache_card,
-                ft.Container(expand=True),
-                ft.FilledButton(
-                    "Log out",
-                    icon=ft.Icons.LOGOUT,
-                    on_click=lambda e: store.logout(),
-                    style=ft.ButtonStyle(
-                        bgcolor=ft.Colors.ERROR_CONTAINER,
-                        color=ft.Colors.ON_ERROR_CONTAINER,
-                    ),
-                ),
             ],
         ),
     )

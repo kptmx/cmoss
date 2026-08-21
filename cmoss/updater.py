@@ -4,20 +4,21 @@ Checks the GitHub Releases API for new versions, downloads the source ZIP,
 and extracts only ``.py`` files (plus directory structure) into the local
 update directory so the bootstrap can overlay them on next launch.
 
-All I/O is async via ``aiohttp`` (already a project dependency).
+Uses ``urllib.request`` (stdlib) to avoid aiohttp rate-limit issues with
+GitHub.
 """
 
 from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
 import os
 import sys
+import urllib.request
 import zipfile
 from dataclasses import dataclass
-
-import aiohttp
 
 from .bootstrap import data_dir, update_dir
 
@@ -26,6 +27,7 @@ log = logging.getLogger(__name__)
 REPO = "kptmx/cmoss"
 _API = f"https://api.github.com/repos/{REPO}/releases/latest"
 _ZIP = "https://github.com/{repo}/archive/refs/tags/{tag}.zip"
+_HEADERS = {"User-Agent": "cmoss", "Accept": "application/vnd.github+json"}
 
 
 # ── version helpers ────────────────────────────────────────────────────
@@ -55,6 +57,10 @@ class Release:
 
 # ── network ────────────────────────────────────────────────────────────
 
+def _request(url: str) -> urllib.request.Request:
+    return urllib.request.Request(url, headers=_HEADERS)
+
+
 async def get_latest_release() -> Release | None:
     """Fetch the latest release metadata from GitHub.
 
@@ -62,13 +68,9 @@ async def get_latest_release() -> Release | None:
     as "no update available".
     """
     try:
-        timeout = aiohttp.ClientTimeout(total=15)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(_API) as resp:
-                if resp.status != 200:
-                    log.warning("GitHub API %s", resp.status)
-                    return None
-                data = await resp.json()
+        resp = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: urllib.request.urlopen(_request(_API), timeout=15))
+        data = json.loads(resp.read())
         return Release(
             tag=data["tag_name"],
             name=data.get("name") or data["tag_name"],
@@ -100,21 +102,27 @@ async def download_update(
     dest = update_dir()
 
     try:
-        timeout = aiohttp.ClientTimeout(total=300)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url) as resp:
-                if resp.status != 200:
-                    log.warning("ZIP download failed: HTTP %s", resp.status)
-                    return False
+        def _download():
+            resp = urllib.request.urlopen(_request(url), timeout=120)
+            total = int(resp.headers.get("Content-Length", -1))
+            buf = io.BytesIO()
+            read = 0
+            while True:
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                buf.write(chunk)
+                read += len(chunk)
+                if on_progress:
+                    on_progress(read, total)
+            return buf, resp.status
 
-                total = int(resp.headers.get("Content-Length", -1))
-                buf = io.BytesIO()
-                read = 0
-                async for chunk in resp.content.iter_chunked(65536):
-                    buf.write(chunk)
-                    read += len(chunk)
-                    if on_progress:
-                        on_progress(read, total)
+        buf, status = await asyncio.get_event_loop().run_in_executor(
+            None, _download)
+
+        if status != 200:
+            log.warning("ZIP download failed: HTTP %s", status)
+            return False
 
         buf.seek(0)
         with zipfile.ZipFile(buf) as zf:
@@ -149,7 +157,11 @@ async def download_update(
 def restart() -> None:
     """Replace the current process with a fresh launch.
 
-    Uses ``os.execv`` so the new process inherits the same PID — this is
-    the cleanest restart on both Linux and Windows.
+    Uses ``subprocess.Popen`` + ``os._exit`` instead of ``os.execv`` —
+    the latter fails under PyInstaller one-file on Windows because
+    ``sys.executable`` points to the temp extraction dir whose DLLs
+    may be locked or already cleaned up.
     """
-    os.execv(sys.executable, [sys.executable] + sys.argv)
+    import subprocess
+    subprocess.Popen([sys.executable] + sys.argv)
+    os._exit(0)

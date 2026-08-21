@@ -14,6 +14,32 @@ import time
 
 from .reactive import DataBox
 
+# python-mpv finds libmpv via ctypes.util.find_library() (system PATH) or
+# next to mpv.py itself.  Neither covers the PyInstaller extraction dir or
+# a dev-layout with winmpv/.  Prepend the likely DLL location to PATH so
+# ctypes.CDLL can resolve it at import time.
+def _ensure_mpv_path() -> None:
+    import os
+    candidates: list[str] = []
+    if getattr(sys, "frozen", False):
+        candidates.append(getattr(sys, "_MEIPASS", os.path.dirname(sys.executable)))
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates.append(os.path.join(here, "..", "winmpv"))
+    for d in candidates:
+        dll = os.path.join(d, "libmpv-2.dll")
+        if not os.path.isfile(dll):
+            continue
+        # os.add_dll_directory (3.8+) is the reliable way on Windows;
+        # PATH is a fallback for older interpreters / Wine edge cases.
+        if hasattr(os, "add_dll_directory"):
+            os.add_dll_directory(d)
+        existing = os.environ.get("PATH", "")
+        if d not in existing:
+            os.environ["PATH"] = d + os.pathsep + existing
+        break
+
+_ensure_mpv_path()
+
 try:
     import mpv as pythonmpv
     _MPV_AVAILABLE = True
@@ -45,12 +71,7 @@ class MpvPlayer:
         # starvation produces no gap. video=no drops the video-decode path
         # entirely (this is an audio-only app).
         opts = {"audio_buffer": 0.7, "video": "no"}
-        if sys.platform == "win32":
-            # WASAPI shared mode routes through the system audio engine, whose
-            # mixing thread starves first under load. Exclusive mode feeds the
-            # device directly from mpv's own buffer; fall back to shared if the
-            # device refuses exclusive access.
-            opts["ao"] = "wasapi:exclusive=yes,wasapi"
+        log.info("mpv init: opts=%s", opts)
         self.player = pythonmpv.MPV(**opts)
         self._state = "stopped"
         self._duration_ms = 0
@@ -94,6 +115,10 @@ class MpvPlayer:
         elif reason == _END_FILE_ERROR:
             log.warning("mpv: playback error (end-file reason=error)")
             self._set_state("stopped")
+            try:
+                self.store.show_toast("Playback error", seconds=4.0)
+            except Exception:
+                pass
 
     # -- python-mpy property observers (mpv thread) -------------------------
 
@@ -168,6 +193,8 @@ class MpvPlayer:
         self._set_state(st)
 
     def _set_state(self, st):
+        if self._shutdown:
+            return
         if st != self._state:
             self._state = st
             if self.on_state_change:
@@ -229,6 +256,7 @@ class MpvPlayer:
                 self.player.title = self._title
             except Exception:
                 pass
+        log.info("mpv play: url=%s", self._url)
         try:
             self.player.play(self._url)
             self.player.pause = False
@@ -236,6 +264,7 @@ class MpvPlayer:
             log.warning("mpv play failed: %s", e)
             self._pending = False
             self._set_state("stopped")
+            self.store.show_toast(f"Play failed: {e}", seconds=4.0)
             return
         self._pending_position = max(0, int(position_ms or 0))
         if self._pending_position and self._duration_ms > 0:
@@ -377,9 +406,17 @@ class PlayerModel:
             except Exception as e:
                 log.error("MpvPlayer init failed, using NullPlayer: %s", e)
                 self.player = NullPlayer()
+                try:
+                    self.store.show_toast(f"mpv init failed: {e}", seconds=5.0)
+                except Exception:
+                    pass
         else:
             log.warning("libmpv unavailable, using NullPlayer")
             self.player = NullPlayer()
+            try:
+                self.store.show_toast("libmpv unavailable", seconds=5.0)
+            except Exception:
+                pass
 
         self.queue: list = []
         self.index: int = -1
@@ -420,11 +457,15 @@ class PlayerModel:
         return None
 
     def _on_state(self, state):
+        if self.store._shutdown_done:
+            return
         self.state.set(state)
         if state == "completed":
             self._on_track_ended()
 
     def _on_position(self, ms):
+        if self.store._shutdown_done:
+            return
         dur = self.duration_ms.get() or int(self.player.duration or 0)
         frac = (ms / dur) if (dur and dur > 0) else 0.0
         # mpv emits time-pos far faster than the UI (or SMTC/MPRIS) can
@@ -441,6 +482,8 @@ class PlayerModel:
         self.progress.set(max(0.0, min(1.0, frac)))
 
     def _on_duration(self, ms):
+        if self.store._shutdown_done:
+            return
         self.duration_ms.set(int(ms))
         self.dur_label.set(fmt_ms(ms))
 
